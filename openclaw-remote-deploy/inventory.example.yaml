@@ -1,0 +1,33 @@
+defaults:
+  ssh:
+    port: 22
+    timeout_sec: 30
+    known_hosts: autoadd
+    key_filename: /Users/your-user/.ssh/id_ed25519
+  install:
+    node_version_major: 22
+    openclaw_package: openclaw@latest
+    workspace: /root/.openclaw/workspace
+    gateway:
+      port: 18789
+      bind: lan
+      auth_mode: token
+      token: replace-with-a-strong-token
+      open_firewall: true
+      install_service: true
+      start_service: true
+      enable_linger: true
+
+hosts:
+  - name: my-vps
+    address: 203.0.113.10
+    username: root
+
+  - name: app-vps
+    address: 198.51.100.20
+    username: ubuntu
+    install:
+      workspace: /home/ubuntu/.openclaw/workspace
+      gateway:
+        port: 18790
+        token: replace-with-another-token
