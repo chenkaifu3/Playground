@@ -48,6 +48,20 @@ MODES = [
 SOURCE_LIST_FILE = OUTPUT_DIR / "profile_source_lists_20260311.md"
 
 
+def profile_label(profile_id: str) -> str:
+    for profile in PROFILES:
+        if profile["id"] == profile_id:
+            return profile["name"]
+    return profile_id
+
+
+def profile_desc(profile_id: str) -> str:
+    for profile in PROFILES:
+        if profile["id"] == profile_id:
+            return profile["desc"]
+    return ""
+
+
 def load_json(path: Path):
     if not path.exists():
         return None
@@ -60,6 +74,17 @@ def load_json(path: Path):
 def summary_path(profile_id: str, mode: str) -> Path:
     suffix = "incremental" if mode == "incremental" else "full"
     return LOGS_DIR / f"summary_{suffix}_{profile_id}.json"
+
+
+def incremental_run_file(profile_id: str) -> Path:
+    return BASE_DIR / "data" / f"last_incremental_run_{profile_id}.txt"
+
+
+def load_incremental_cutoff(profile_id: str) -> str:
+    path = incremental_run_file(profile_id)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
 
 
 def latest_state(profile_id: str, mode: str):
@@ -77,22 +102,25 @@ def latest_state(profile_id: str, mode: str):
         }
     issue_summary = ""
     issues_file = summary.get("issues_file", "")
+    effective_issues_count = summary.get("issues_count")
     if issues_file:
         issues = load_json(Path(issues_file))
         if isinstance(issues, list) and issues:
-            first = issues[0]
-            source = first.get("source", "未知来源")
-            problem = first.get("problem", "未知问题")
-            action = first.get("action", "无动作")
-            issue_summary = f"{source}: {problem} -> {action}"
+            effective_issues_count = len(issues)
+            if issues:
+                first = issues[0]
+                source = first.get("source", "未知来源")
+                problem = first.get("problem", "未知问题")
+                action = first.get("action", "无动作")
+                issue_summary = f"{source}: {problem} -> {action}"
     return {
         "summary_file": str(summary_path(profile_id, mode)),
         "output_file": summary.get("output_file", ""),
         "issues_file": issues_file,
         "count": summary.get("count"),
-        "cutoff": summary.get("cutoff", ""),
+        "cutoff": load_incremental_cutoff(profile_id) if mode == "incremental" else summary.get("cutoff", ""),
         "wall_time_sec": summary.get("wall_time_sec"),
-        "issues_count": summary.get("issues_count"),
+        "issues_count": effective_issues_count,
         "issue_summary": issue_summary,
     }
 
@@ -124,17 +152,48 @@ def latest_output_by_profile(states: dict) -> dict:
     return result
 
 
-def latest_output_overview_path(latest_outputs: dict) -> str:
-    candidates = []
-    for path in latest_outputs.values():
-        if not path:
+def classify_output_file(path: Path) -> str:
+    name = path.name
+    for profile in PROFILES:
+        if profile["id"] in name:
+            return profile["id"]
+    return "legacy"
+
+
+def collect_history_hits():
+    groups = {profile["id"]: [] for profile in PROFILES}
+    groups["legacy"] = []
+    seen = set()
+    for path in sorted(OUTPUT_DIR.glob("hits*.json")):
+        if path.name == "hits_full_fast_summary.json":
             continue
-        p = Path(path)
-        if p.exists():
-            candidates.append((p.stat().st_mtime, path))
-    if not candidates:
-        return ""
-    return max(candidates)[1]
+        data = load_json(path)
+        if not isinstance(data, list) or not data:
+            continue
+        bucket = classify_output_file(path)
+        for item in data:
+            title = str(item.get("title", "")).strip()
+            url = str(item.get("url", "")).strip()
+            item_id = str(item.get("id", "")).strip()
+            published_at = str(item.get("published_at", "")).strip()
+            if not title and not url:
+                continue
+            key = (bucket, item_id or "", title, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            groups[bucket].append(
+                {
+                    "title": title,
+                    "url": url,
+                    "source": str(item.get("source", "")).strip(),
+                    "published_at": published_at,
+                    "file": str(path),
+                }
+            )
+    for bucket, items in groups.items():
+        items.sort(key=lambda x: (x.get("published_at", ""), x.get("title", "")), reverse=True)
+    return groups
 
 
 def render_card(profile: dict, state: dict) -> str:
@@ -205,8 +264,6 @@ def render_card(profile: dict, state: dict) -> str:
 
 def dashboard_html():
     states = all_states()
-    latest_outputs = latest_output_by_profile(states)
-    latest_overview = latest_output_overview_path(latest_outputs)
     cards_html = "".join(render_card(profile, states[profile["id"]]) for profile in PROFILES)
     generated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return f"""<!doctype html>
@@ -487,15 +544,15 @@ def dashboard_html():
       <div class="hero-card">
         <h1>Tender Watch 控制台</h1>
         <div class="sub">
-          4 个 profile、2 种采集模式的本地控制页。支持弹出终端运行、查看最新命中/结果/问题日志，以及打开输出目录。
+          4 个 profile、2 种采集模式的本地控制页。支持弹出终端运行、查看命中/结果/问题日志，以及打开工作文件夹。
         </div>
         <div class="toolbar">
           <span class="status-chip">最近渲染 <span id="last-refresh">{generated_at}</span></span>
           <button class="warn" onclick="refreshState()">刷新状态</button>
           <button onclick="runAllIncremental()">一键全部增量采集</button>
-          <button class="secondary" onclick='viewLatestHits({json.dumps(latest_overview, ensure_ascii=False)})'>查看最新命中汇总</button>
-          <button class="secondary" onclick="openPath('/Users/openclaw/Documents/Playground/tender-watch/output')">打开 output 目录</button>
-          <button class="secondary" onclick="openPath('/Users/openclaw/Documents/Playground/tender-watch/logs')">打开 logs 目录</button>
+          <button class="secondary" onclick="window.open('/latest_hits_overview', '_blank')">查看最新命中汇总</button>
+          <button class="secondary" onclick="window.open('/history_hits_overview', '_blank')">查看所有历史命中汇总</button>
+          <button class="secondary" onclick="openPath('/Users/openclaw/Documents/Playground/tender-watch')">打开工作文件夹目录</button>
           <button class="alt" onclick="window.open('/viewer?kind=markdown&path=' + encodeURIComponent('{SOURCE_LIST_FILE}'), '_blank')">查看 4 个 Profile 源清单</button>
         </div>
       </div>
@@ -717,6 +774,98 @@ def render_latest_hits(path: Path) -> str:
     </style></head><body><header>{html.escape(str(path))}</header><main>{body}</main></body></html>"""
 
 
+def render_latest_hits_overview() -> str:
+    states = all_states()
+    latest_outputs = latest_output_by_profile(states)
+    blocks = []
+    for profile in PROFILES:
+        pid = profile["id"]
+        heading = f"{profile['name']} {profile['desc']}"
+        path_str = latest_outputs.get(pid, "")
+        if not path_str:
+            blocks.append(
+                f"<section><h3>{html.escape(heading)}</h3><p>当前没有结果文件。</p></section>"
+            )
+            continue
+        path = Path(path_str)
+        data = load_json(path) if path.exists() else None
+        if not isinstance(data, list):
+            blocks.append(
+                f"<section><h3>{html.escape(heading)}</h3><p>结果文件不可读：{html.escape(path_str)}</p></section>"
+            )
+            continue
+        if not data:
+            blocks.append(
+                f"<section><h3>{html.escape(heading)}</h3><p>命中数 0。</p></section>"
+            )
+            continue
+        rows = []
+        for idx, item in enumerate(data[:5], start=1):
+            title = html.escape(str(item.get("title", "")))
+            source = html.escape(str(item.get("source", "")))
+            published_at = html.escape(str(item.get("published_at", "")))
+            url = html.escape(str(item.get("url", "")))
+            rows.append(
+                f"<li><strong>{idx}. {title}</strong><br>"
+                f"<span>{source} | {published_at}</span><br>"
+                f"<a href=\"{url}\" target=\"_blank\">{url}</a></li>"
+            )
+        blocks.append(
+            f"<section><h3>{html.escape(heading)}（命中 {len(data)}）</h3><ol>{''.join(rows)}</ol></section>"
+        )
+    body = "".join(blocks)
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>最新命中汇总</title>
+    <style>
+    body{{margin:0;background:#f5f7f2;color:#1d2a1f;font-family:\"PingFang SC\",\"Hiragino Sans GB\",\"Noto Sans CJK SC\",sans-serif}}
+    header{{padding:14px 18px;background:#dfe8d6;border-bottom:1px solid #c8d3c0;font-weight:700}}
+    main{{padding:18px 22px;line-height:1.6}}
+    section{{margin-bottom:22px;padding:14px;border:1px solid #d3dccb;border-radius:12px;background:#fbfdf8}}
+    h3{{margin:0 0 10px;font-size:16px}}
+    ol{{padding-left:22px;margin:0}}
+    li{{margin:0 0 14px}}
+    a{{color:#235c3d;word-break:break-all}}
+    span{{color:#617066;font-size:13px}}
+    p{{margin:0;color:#617066}}
+    </style></head><body><header>4 个 Profile 最新命中汇总</header><main>{body}</main></body></html>"""
+
+
+def render_history_hits_overview() -> str:
+    groups = collect_history_hits()
+    sections = []
+    ordered = [p["id"] for p in PROFILES] + ["legacy"]
+    for bucket in ordered:
+        items = groups.get(bucket, [])
+        title = "兼容历史文件" if bucket == "legacy" else f"{profile_label(bucket)} {profile_desc(bucket)}"
+        if not items:
+            sections.append(f"<section><h3>{html.escape(title)}</h3><p>暂无历史命中。</p></section>")
+            continue
+        rows = []
+        for idx, item in enumerate(items[:30], start=1):
+            rows.append(
+                f"<li><strong>{idx}. {html.escape(item['title'])}</strong><br>"
+                f"<span>{html.escape(item['source'])} | {html.escape(item['published_at'])}</span><br>"
+                f"<a href=\"{html.escape(item['url'])}\" target=\"_blank\">{html.escape(item['url'])}</a><br>"
+                f"<span>文件：{html.escape(item['file'])}</span></li>"
+            )
+        sections.append(
+            f"<section><h3>{html.escape(title)}（历史去重命中 {len(items)}）</h3><ol>{''.join(rows)}</ol></section>"
+        )
+    body = "".join(sections)
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>所有历史命中汇总</title>
+    <style>
+    body{{margin:0;background:#f5f7f2;color:#1d2a1f;font-family:\"PingFang SC\",\"Hiragino Sans GB\",\"Noto Sans CJK SC\",sans-serif}}
+    header{{padding:14px 18px;background:#dfe8d6;border-bottom:1px solid #c8d3c0;font-weight:700}}
+    main{{padding:18px 22px;line-height:1.6}}
+    section{{margin-bottom:22px;padding:14px;border:1px solid #d3dccb;border-radius:12px;background:#fbfdf8}}
+    h3{{margin:0 0 10px;font-size:16px}}
+    ol{{padding-left:22px;margin:0}}
+    li{{margin:0 0 14px}}
+    a{{color:#235c3d;word-break:break-all}}
+    span{{color:#617066;font-size:13px}}
+    p{{margin:0;color:#617066}}
+    </style></head><body><header>所有历史命中汇总</header><main>{body}</main></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_text(self, text, status=200, content_type="text/html; charset=utf-8"):
         payload = text.encode("utf-8")
@@ -747,6 +896,10 @@ class Handler(BaseHTTPRequestHandler):
             if not path.exists():
                 return self._send_text("file not found", HTTPStatus.NOT_FOUND)
             return self._send_text(render_latest_hits(path))
+        if parsed.path == "/latest_hits_overview":
+            return self._send_text(render_latest_hits_overview())
+        if parsed.path == "/history_hits_overview":
+            return self._send_text(render_history_hits_overview())
         if parsed.path == "/viewer":
             raw_path = params.get("path", [""])[0]
             kind = params.get("kind", ["json"])[0]

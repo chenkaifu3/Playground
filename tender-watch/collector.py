@@ -8,9 +8,10 @@ import random
 import re
 import shutil
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -582,10 +583,34 @@ SITE_PROFILES = {
     },
     "bulletin.cebpubservice.com": {
         "fetch_mode": "requests",
-        "source_budget": 6,
+        "source_budget": 20,
+        "incremental_source_budget": 20,
         "channel_limit": 1,
         "page_limit": 1,
-        "detail_limit": 0,
+        "detail_limit": 4,
+        "incremental_detail_limit": 2,
+        "seed_only": True,
+    },
+    "www.ccgp.gov.cn": {
+        "fetch_mode": "requests",
+        "preferred_scheme": "http",
+        "source_budget": 20,
+        "incremental_source_budget": 20,
+        "channel_limit": 1,
+        "page_limit": 1,
+        "detail_limit": 4,
+        "incremental_detail_limit": 2,
+        "seed_only": True,
+    },
+    "www.ggzy.gov.cn": {
+        "fetch_mode": "requests",
+        "preferred_scheme": "http",
+        "source_budget": 20,
+        "incremental_source_budget": 20,
+        "channel_limit": 1,
+        "page_limit": 1,
+        "detail_limit": 4,
+        "incremental_detail_limit": 2,
         "seed_only": True,
     },
     "ggzy.yn.gov.cn": {
@@ -600,11 +625,12 @@ SITE_PROFILES = {
     "jtt.hubei.gov.cn": {
         "fetch_mode": "playwright",
         "source_budget": 150,
-        "incremental_source_budget": 12,
+        "incremental_source_budget": 60,
         "channel_limit": 1,
         "page_limit": 5,
-        "detail_limit": 16,
+        "detail_limit": 80,
         "incremental_detail_limit": 4,
+        "incremental_page_limit": 1,
         "candidate_limit": 6,
         "seed_only": True,
         "include_source_url": False,
@@ -1762,6 +1788,96 @@ def save_seen(seen):
     (DATA / "seen_ids.txt").write_text("\n".join(sorted(seen)), encoding="utf-8")
 
 
+def extract_notice_token(url):
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    for key in ("sectionId", "id", "noticeId", "articleId", "bidSectionId"):
+        value = query.get(key, [""])[0].strip()
+        if value:
+            return f"{key}:{value.lower()}"
+    parts = [p for p in parsed.path.split("/") if p]
+    for part in reversed(parts):
+        token = part.rsplit(".", 1)[0]
+        try:
+            uuid.UUID(token)
+            return f"pathuuid:{token.lower()}"
+        except Exception:
+            continue
+    return ""
+
+
+def normalized_title_key(title):
+    return normalize(title).lower()
+
+
+def item_priority(item):
+    source_name = str(item.get("source", ""))
+    source_type = str(item.get("source_type", ""))
+    score = {
+        "operator": 60,
+        "transport_dept": 50,
+        "provincial": 40,
+        "portal": 10,
+    }.get(source_type, 0)
+    if source_name.startswith("中国") or source_name.startswith("全国"):
+        score -= 20
+    if "省公共资源交易中心" in source_name or "省公共资源交易平台" in source_name:
+        score -= 6
+    if "市公共资源交易中心" in source_name or "州公共资源交易中心" in source_name:
+        score += 6
+    if "交通运输厅" in source_name or "交通委员会" in source_name:
+        score += 4
+    if "交投" in source_name or "高速" in source_name:
+        score += 5
+    return (
+        score,
+        str(item.get("published_at", "")),
+        str(item.get("fetched_at", "")),
+        len(str(item.get("url", ""))),
+    )
+
+
+def dedupe_result_items(items):
+    by_notice = {}
+    for item in items:
+        token = extract_notice_token(str(item.get("url", "")))
+        if not token:
+            continue
+        chosen = by_notice.get(token)
+        if chosen is None or item_priority(item) > item_priority(chosen):
+            by_notice[token] = item
+
+    notice_deduped = []
+    seen_obj_ids = set()
+    for item in items:
+        token = extract_notice_token(str(item.get("url", "")))
+        if token and by_notice.get(token) is not item:
+            continue
+        obj_id = id(item)
+        if obj_id in seen_obj_ids:
+            continue
+        seen_obj_ids.add(obj_id)
+        notice_deduped.append(item)
+
+    by_title = {}
+    for item in notice_deduped:
+        title_key = normalized_title_key(str(item.get("title", "")))
+        if not title_key:
+            continue
+        chosen = by_title.get(title_key)
+        if chosen is None or item_priority(item) > item_priority(chosen):
+            by_title[title_key] = item
+
+    deduped = []
+    kept_ids = {id(v) for v in by_title.values()}
+    for item in notice_deduped:
+        title_key = normalized_title_key(str(item.get("title", "")))
+        if title_key and id(item) not in kept_ids:
+            continue
+        deduped.append(item)
+    return deduped
+
+
 def load_last_incremental_run(profile=None):
     run_file = get_last_incremental_run_file(profile)
     if run_file.exists():
@@ -2145,6 +2261,7 @@ def fetch_api_items(source, profile):
                         "url": href,
                         "source": source["name"],
                         "province": source["province"],
+                        "source_type": source["type"],
                         "category": classify(body),
                         "published_at": published_at.replace("T", " ")[:19],
                         "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2215,6 +2332,29 @@ def suppress_nonfatal_detail_budget_noise(source_name, items):
     RUN_ISSUE_KEYS.update(keep_keys)
 
 
+def suppress_nonfatal_incremental_pagination_noise(source_name, items, snapshot):
+    # 湖北交通厅在增量模式下偶发频道页瞬时不可达或过挑战超时，不影响当轮增量结果，降为非告警。
+    if snapshot or source_name != "湖北省交通运输厅":
+        return
+    keep_issues = []
+    keep_keys = set()
+    for issue in RUN_ISSUES:
+        key = (issue["source"], issue["stage"], issue["problem"], issue["action"])
+        if issue["source"] == source_name and issue["stage"] == "pagination" and issue["problem"] == "channel_page_unavailable":
+            ISSUE_COUNTS.pop(key, None)
+            ISSUE_SAMPLES.pop(key, None)
+            continue
+        if issue["source"] == source_name and issue["stage"] == "source_budget" and issue["problem"] == "source_timeout":
+            ISSUE_COUNTS.pop(key, None)
+            ISSUE_SAMPLES.pop(key, None)
+            continue
+        keep_issues.append(issue)
+        keep_keys.add(key)
+    RUN_ISSUES[:] = keep_issues
+    RUN_ISSUE_KEYS.clear()
+    RUN_ISSUE_KEYS.update(keep_keys)
+
+
 def collect_source_result(source, cutoff, snapshot, retry_issue_map, active_profile=None):
     global ACTIVE_PROFILE, rules
     if active_profile:
@@ -2225,6 +2365,7 @@ def collect_source_result(source, cutoff, snapshot, retry_issue_map, active_prof
     items = fetch_items(source, cutoff=cutoff, snapshot=snapshot, retry_issue_map=retry_issue_map)
     suppress_successful_timeout_noise(source.get("name", ""), items)
     suppress_nonfatal_detail_budget_noise(source.get("name", ""), items)
+    suppress_nonfatal_incremental_pagination_noise(source.get("name", ""), items, snapshot)
     result = {
         "source": source,
         "items": items,
@@ -2346,9 +2487,10 @@ def run_collect(snapshot=False, retry_only=False, retry_scope="all", workers=1):
         status_label = "retry" if retry_only else ("full" if snapshot else "new")
         print(f"[{s['name']}] {status_label}={kept}")
 
+    items = dedupe_result_items(items)
+
     if not snapshot:
         save_seen(seen)
-        save_last_incremental_run(run_started_at, ACTIVE_PROFILE)
     save_fetch_strategy(FETCHER.domain_mode)
 
     aggregated_issues = []
@@ -2404,6 +2546,10 @@ def run_collect(snapshot=False, retry_only=False, retry_scope="all", workers=1):
     else:
         legacy_summary_file = LOGS / ("summary_full.json" if snapshot else "summary_incremental.json")
     legacy_summary_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Only advance the incremental cutoff after outputs and summaries are durably written.
+    if not snapshot and not retry_only:
+        save_last_incremental_run(run_started_at, ACTIVE_PROFILE)
 
     label = "total_retry" if retry_only else ("total_full" if snapshot else "new_items")
     print(f"{label}={len(items)}")
@@ -2527,7 +2673,8 @@ def fetch_items(source, cutoff, snapshot, retry_issue_map=None):
                     if not (hit_maint_design(txt) or hit_include(txt) or hit_highway_signal(txt)):
                         continue
                     if checked_detail >= profile["detail_limit"]:
-                        record_issue(source, "detail_budget", "detail_limit_exceeded", page_url, action="skip_page_details")
+                        if profile["detail_limit"] > 0:
+                            record_issue(source, "detail_budget", "detail_limit_exceeded", page_url, action="skip_page_details")
                         continue
                     if href not in detail_cache:
                         detail_cache[href] = fetch_detail_text(href, profile["fetch_mode"])
@@ -2549,7 +2696,8 @@ def fetch_items(source, cutoff, snapshot, retry_issue_map=None):
                     else:
                         if need_detail:
                             if checked_detail >= profile["detail_limit"]:
-                                record_issue(source, "detail_budget", "detail_limit_exceeded", page_url, action="skip_page_details")
+                                if profile["detail_limit"] > 0:
+                                    record_issue(source, "detail_budget", "detail_limit_exceeded", page_url, action="skip_page_details")
                                 continue
                             if href not in detail_cache:
                                 detail_cache[href] = fetch_detail_text(href, profile["fetch_mode"])
@@ -2564,7 +2712,8 @@ def fetch_items(source, cutoff, snapshot, retry_issue_map=None):
                             pass
                         else:
                             if checked_detail >= profile["detail_limit"]:
-                                record_issue(source, "detail_budget", "detail_limit_exceeded", page_url, action="skip_page_details")
+                                if profile["detail_limit"] > 0:
+                                    record_issue(source, "detail_budget", "detail_limit_exceeded", page_url, action="skip_page_details")
                                 continue
                             if href not in detail_cache:
                                 detail_cache[href] = fetch_detail_text(href, profile["fetch_mode"])
@@ -2597,6 +2746,7 @@ def fetch_items(source, cutoff, snapshot, retry_issue_map=None):
                         "url": href,
                         "source": source["name"],
                         "province": source["province"],
+                        "source_type": source["type"],
                         "category": classify(txt),
                         "published_at": publish_dt.strftime("%Y-%m-%d %H:%M:%S"),
                         "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
